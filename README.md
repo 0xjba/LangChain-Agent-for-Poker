@@ -25,7 +25,7 @@ An autonomous poker agent system powered by OpenRouter LLM that interacts with s
 
 1. Clone the repository:
 ```bash
-git clone https://github.com/yourusername/poker-agents.git
+git clone https://github.com/0xjba/LangChain-Agent-for-Poker.git
 cd poker-agents
 ```
 
