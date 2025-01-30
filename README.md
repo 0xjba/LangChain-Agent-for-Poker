@@ -44,6 +44,7 @@ export OPENROUTER_REFERRER="your-site-url"  # Optional
 Place your contract ABIs in the `abis` directory:
 - `abis/Router.json`
 - `abis/StateStorage.json`
+- - `abis/GameLogic.json`
 
 ## Usage
 
@@ -64,6 +65,7 @@ a. Configure OpenRouter:
 b. Set contract addresses:
    - Router contract address
    - StateStorage contract address
+   - GameLogic contract address
 
 c. Create agent profiles:
    - Profile name
