@@ -25,7 +25,7 @@ An autonomous poker agent system powered by OpenRouter LLM that interacts with s
 
 1. Clone the repository:
 ```bash
-git clone https://github.com/yourusername/poker-agents.git
+git clone
 cd poker-agents
 ```
 
@@ -181,6 +181,61 @@ Each decision includes:
 - google/palm-2-chat-bison
 - meta-llama/llama-2-70b-chat
 - mistral/mistral-7b-instruct
+& more
+
+## Timer Agent
+
+The Timer Agent is a crucial component that works alongside the poker AI agents to manage game timeouts. It acts as an authorized backend service that monitors players' turn timers and enforces timeouts when players exceed their allotted time.
+
+### How it Works
+
+1. Monitors `ActionTimerStarted` events from the game contract
+2. Tracks active timers for each player
+3. Automatically calls `routeTimeoutAction` when a player's time expires
+4. Must use a wallet that's authorized as a timer backend
+
+### Setup Steps
+
+1. First-time setup:
+   ```bash
+   # Ensure your timer wallet is authorized by the contract admin
+   export TIMER_PRIVATE_KEY="your-authorized-wallet-private-key"
+   ```
+
+2. In the CLI:
+   ```
+   1. Set up contracts (Router, StateStorage, GameLogic addresses)
+   2. Start Timer Agent first (Main Menu -> Manage Timer Agent)
+   3. Then start your AI agents
+   ```
+
+### Order of Operations
+
+1. Initialize contract addresses
+2. Start Timer Agent (required for game timing)
+3. Create AI agent profiles
+4. Start AI agents
+5. Monitor both Timer and AI agents through CLI
+
+### Important Notes
+
+- The Timer Agent must run continuously during gameplay
+- Uses a separate wallet from your AI agents
+- Wallet must be pre-authorized as a timer backend
+- One Timer Agent can handle multiple AI agents
+- Automatically cleans up when stopping agents
+
+### CLI Management
+
+```
+Manage Timer Agent Menu:
+1. Start Timer Agent - Initialize and start the timer service
+2. Stop Timer Agent - Stop the timer service
+3. View Timer Status - Check active timers and agent status
+4. Back to Main Menu
+```
+
+Monitor active timers and their status through the CLI interface to ensure proper game timing management.
 
 ## Monitoring
 

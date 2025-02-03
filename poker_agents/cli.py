@@ -9,6 +9,9 @@ from typing import Dict
 from tabulate import tabulate
 from datetime import datetime
 
+from .timer_agent import TimerAgent
+from typing import Dict, Optional
+
 from .agent import PokerAgent
 from .constants import CONFIG_DIR, PROFILES_FILE, CURRENT_SESSION, SessionConfig
 from .openrouter_client import OpenRouterClient
@@ -70,16 +73,83 @@ class ProfileManager:
 
 class PokerAgentCLI:
     def __init__(self):
-        self.profile_manager = ProfileManager()
-        self.active_agents: Dict[str, PokerAgent] = {}
-        self.running = True
+        try:
+            self.profile_manager = ProfileManager()
+            self.active_agents: Dict[str, PokerAgent] = {}
+            self.timer_agent: Optional[TimerAgent] = None
+            self.running = True
+        except Exception as e:
+            logger.error(f"Failed to initialize CLI: {e}")
+            raise
+
+    async def setup_timer_agent(self):
+        """Set up and start the timer agent"""
+        if self.timer_agent and self.timer_agent.is_running:
+            print("Timer agent is already running!")
+            return
+
+        print("\nSet up timer agent")
+        
+        rpc_url = await questionary.text("Enter RPC URL:").ask_async()
+        private_key = await questionary.password(
+            "Enter timer backend private key (must be authorized):"
+        ).ask_async()
+
+        timer_agent = TimerAgent()
+        try:
+            success = await timer_agent.initialize(
+                rpc_url=rpc_url,
+                private_key=private_key,
+                router_address=CURRENT_SESSION.router_address,
+                game_logic_address=CURRENT_SESSION.game_logic_address
+            )
+
+            if success:
+                self.timer_agent = timer_agent
+                # Create task for timer agent
+                asyncio.create_task(timer_agent.start())
+                print("Timer agent started successfully!")
+            else:
+                print("Failed to initialize timer agent!")
+
+        except Exception as e:
+            print(f"Error starting timer agent: {e}")
+
+    async def stop_timer_agent(self):
+        """Stop the timer agent"""
+        if not self.timer_agent or not self.timer_agent.is_running:
+            print("No timer agent is running!")
+            return
+
+        await self.timer_agent.stop()
+        print("Timer agent stopped successfully!")
+
+    async def view_timer_status(self):
+        """View timer agent status"""
+        if not self.timer_agent:
+            print("\nTimer agent not initialized")
+            return
+
+        print("\nTimer Agent Status:")
+        print(f"Running: {self.timer_agent.is_running}")
+        print(f"Address: {self.timer_agent.account.address if self.timer_agent.account else 'Not set'}")
+        print("\nActive Timers:")
+        for player, expiry in self.timer_agent.active_timers.items():
+            time_left = expiry - datetime.now()
+            print(f"Player: {player}")
+            print(f"Time remaining: {time_left.total_seconds():.1f}s")
+
+        input("\nPress Enter to continue...")
 
     async def cleanup(self):
-        """Clean up all running agents"""
+        """Cleanup all agents on exit"""
         if self.active_agents:
-            print("\nStopping all active agents...")
+            print("\nStopping all poker agents...")
             await self.stop_all_agents()
-        self.running = False
+        
+        if self.timer_agent and self.timer_agent.is_running:
+            print("Stopping timer agent...")
+            await self.timer_agent.stop()
 
     async def main_menu(self):
         """Main menu loop with error handling"""
@@ -88,19 +158,20 @@ class PokerAgentCLI:
             await self.setup_contract_addresses()
 
             while self.running:
-                try:
-                    choice = await questionary.select(
-                        "Poker Agent Manager - Main Menu",
-                        choices=[
-                            "1. Manage Profiles",
-                            "2. Start Agents",
-                            "3. Stop Agents",
-                            "4. View Status",
-                            "5. Update Contract Addresses",
-                            "6. Exit"
-                        ]
-                    ).ask_async()
+                choice = await questionary.select(
+                    "Poker Agent Manager - Main Menu",
+                    choices=[
+                        "1. Manage Profiles",
+                        "2. Start Agents",
+                        "3. Stop Agents",
+                        "4. View Status",
+                        "5. Update Contract Addresses",
+                        "6. Manage Timer Agent",  # Added this option
+                        "7. Exit"
+                    ]
+                ).ask_async()
 
+                try:
                     if "1." in choice:
                         await self.profile_management_menu()
                     elif "2." in choice:
@@ -111,6 +182,8 @@ class PokerAgentCLI:
                         await self.view_status()
                     elif "5." in choice:
                         await self.setup_contract_addresses()
+                    elif "6." in choice:  # Added this handler
+                        await self.timer_agent_menu()
                     else:
                         if await self.confirm_exit():
                             break
@@ -118,18 +191,37 @@ class PokerAgentCLI:
                 except Exception as e:
                     logger.error(f"Error in menu operation: {e}")
                     print(f"\nError occurred: {e}")
-                    if await questionary.confirm("Continue to main menu?").ask_async():
-                        continue
-                    else:
+                    if not await questionary.confirm("Continue to main menu?").ask_async():
                         break
 
         except KeyboardInterrupt:
             print("\nReceived exit signal...")
-        except Exception as e:
-            logger.error(f"Fatal error: {e}")
-            print(f"\nFatal error occurred: {e}")
         finally:
+            self.running = False
             await self.cleanup()
+
+    async def timer_agent_menu(self):
+        """Menu for managing timer agent"""
+        while True:
+            status = "Running" if (self.timer_agent and self.timer_agent.is_running) else "Stopped"
+            choice = await questionary.select(
+                f"Timer Agent Management (Status: {status})",
+                choices=[
+                    "1. Start Timer Agent",
+                    "2. Stop Timer Agent",
+                    "3. View Timer Agent Status",
+                    "4. Back to Main Menu"
+                ]
+            ).ask_async()
+
+            if "1." in choice:
+                await self.setup_timer_agent()
+            elif "2." in choice:
+                await self.stop_timer_agent()
+            elif "3." in choice:
+                await self.view_timer_status()
+            else:
+                break
 
     async def setup_contract_addresses(self):
         """Set up contract addresses for the session"""
