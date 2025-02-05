@@ -78,9 +78,18 @@ class PokerAgentCLI:
             self.active_agents: Dict[str, PokerAgent] = {}
             self.timer_agent: Optional[TimerAgent] = None
             self.running = True
+            self.config_manager = ConfigManager(CONFIG_FILE)
+            self._load_config()
         except Exception as e:
             logger.error(f"Failed to initialize CLI: {e}")
             raise
+
+    def _load_config(self):
+        config = self.config_manager.load_config()
+        if contract_config := config['contracts']:
+            CURRENT_SESSION.router_address = contract_config['router']
+            CURRENT_SESSION.state_storage_address = contract_config['state_storage']
+            CURRENT_SESSION.game_logic_address = contract_config['game_logic']
 
     async def setup_timer_agent(self):
         """Set up and start the timer agent"""
@@ -272,38 +281,35 @@ class PokerAgentCLI:
                 print("OpenRouter API key not found! Please set OPENROUTER_API_KEY environment variable.")
                 return
 
-            # Get available models
-            print("Fetching available models from OpenRouter...")
-            client = OpenRouterClient()
-            models = client.get_available_models()
-            
-            if not models:
-                print("Failed to fetch models. Using default (claude-2)")
-                model_name = "anthropic/claude-2"
-            else:
-                # Format choices with model name and context length
-                model_choices = [
-                    f"{model['id']} ({model['context_length']} tokens)"
-                    for model in models
-                ]
-                choice = await questionary.select(
-                    "Select model to use:",
-                    choices=model_choices
-                ).ask_async()
-                # Extract model ID from choice
-                model_name = choice.split(" (")[0]
-
-            # Get profile info
+            # Get profile name first to check env vars
             name = await questionary.text("Enter profile name:").ask_async()
-            
             if self.profile_manager.get_profile(name):
                 print(f"Profile '{name}' already exists!")
                 return
 
-            rpc_url = await questionary.text("Enter RPC URL:").ask_async()
-            private_key = await questionary.password(
-                "Enter private key (will be encrypted):"
-            ).ask_async()
+            # Generate env var names
+            env_prefix = f"POKER_AGENT_{name.upper()}"
+            rpc_var = f"{env_prefix}_RPC"
+            key_var = f"{env_prefix}_KEY"
+            model_var = f"{env_prefix}_MODEL"
+
+            # Get model - either from env or user selection
+            model_name = os.getenv(model_var)
+            if not model_name:
+                print("Fetching available models from OpenRouter...")
+                client = OpenRouterClient()
+                models = client.get_available_models()
+                
+                if not models:
+                    model_name = "anthropic/claude-2"
+                else:
+                    model_choices = [f"{model['id']} ({model['context_length']} tokens)" for model in models]
+                    choice = await questionary.select("Select model to use:", choices=model_choices).ask_async()
+                    model_name = choice.split(" (")[0]
+
+            # Get RPC and key - from env or user input
+            rpc_url = os.getenv(rpc_var) or await questionary.text("Enter RPC URL:").ask_async()
+            private_key = os.getenv(key_var) or await questionary.password("Enter private key:").ask_async()
 
             success = self.profile_manager.create_profile(
                 name=name,
@@ -313,9 +319,12 @@ class PokerAgentCLI:
             )
 
             if success:
+                self.config_manager.save_agent_config(name, rpc_var, key_var, model_var)
                 print(f"Profile '{name}' created successfully!")
-                print(f"Model: {model_name}")
-                print(f"RPC URL: {rpc_url}")
+                print(f"Environment variables for future use:")
+                print(f"RPC URL: {rpc_var}")
+                print(f"Private Key: {key_var}")
+                print(f"Model: {model_var}")
             else:
                 print(f"Failed to create profile '{name}'")
 

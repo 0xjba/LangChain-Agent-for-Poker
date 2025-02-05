@@ -1,0 +1,20 @@
+{
+    "contracts": {
+      "router": "0x...",
+      "state_storage": "0x...",
+      "game_logic": "0x..."
+    },
+    "timer_agent": {
+      "rpc_url": "https://...",
+      "private_key": "0x..."
+    },
+    "agents": {
+      "MyAgent1": {
+        "env_vars": {
+          "rpc_url": "AGENT1_RPC",
+          "private_key": "AGENT1_KEY",
+          "model": "AGENT1_MODEL"
+        }
+      }
+    }
+  }

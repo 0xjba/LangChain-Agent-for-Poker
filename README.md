@@ -34,10 +34,45 @@ cd poker-agents
 pip install -r requirements.txt
 ```
 
-3. Set up environment variables:
-```bash
+## Configuration
+
+### Environment Variables
+Set contract addresses and agent details via environment variables:
+
+# Contract Addresses
+export POKER_ROUTER_ADDRESS="0x..."
+export POKER_STATE_STORAGE_ADDRESS="0x..."
+export POKER_GAME_LOGIC_ADDRESS="0x..."
+
+# Timer Agent
+export POKER_TIMER_RPC="https://..."
+export POKER_TIMER_KEY="timer_key"
+
+# Agent Profiles
+export POKER_AGENT_[NAME]_RPC="https://..."
+export POKER_AGENT_[NAME]_KEY="key"
+export POKER_AGENT_[NAME]_MODEL="model_name"
+
 export OPENROUTER_API_KEY="your-api-key"
 export OPENROUTER_REFERRER="your-site-url"  # Optional
+
+## Profile Structure
+Config.json example:
+```
+{
+    "profiles": {
+        "agent1": {
+            "id": "unique_id",
+            "env_vars": {
+                "rpc_url": "POKER_AGENT_NAME_RPC",
+                "private_key": "POKER_AGENT_NAME_KEY",
+                "model": "POKER_AGENT_NAME_MODEL"
+            },
+            "created_at": "timestamp",
+            "last_used": "timestamp"
+        }
+    }
+}
 ```
 
 4. Add contract ABIs:
@@ -48,12 +83,17 @@ Place your contract ABIs in the `abis` directory:
 
 ## Usage
 
-### Using the CLI Interface
+### Starting the System
 
-1. Start the CLI:
-```bash
-python run.py
-```
+Two ways to run:
+
+1. Using Environment Variables:
+- Set required environment variables
+- Run `python run.py` - will start automatically
+
+2. Using Interactive CLI:
+- Run `python run.py --interactive`
+- Follow menu prompts
 
 2. First-time setup:
 ```

@@ -16,7 +16,7 @@ class SessionConfig:
 
 # Global session config that will be used by all agents
 CURRENT_SESSION = SessionConfig()
-
+CONFIG_FILE = CONFIG_DIR / 'config.json'
 CONFIG_DIR = Path.home() / '.poker-agent'
 PROFILES_FILE = CONFIG_DIR / 'profiles.json'
 MIN_BALANCE_THRESHOLD = 0.1
