@@ -429,18 +429,18 @@ class PokerAgent:
                 from_block = max(0, latest_block - 10)  # Look back 10 blocks
 
                 # Event signature for ActionTimerStarted(address,uint256,uint256)
-                event_signature = self.web3.keccak(
+                event_signature = '0x' + self.web3.keccak(
                     text="ActionTimerStarted(address,uint256,uint256)"
                 ).hex()
                 
-                # Get logs directly
+                # Get logs
                 logs = self.web3.eth.get_logs({
                     'address': self.game_logic.address,
                     'fromBlock': from_block,
                     'toBlock': 'latest',
                     'topics': [
                         event_signature,
-                        "0x" + self.account.address[2:].zfill(64)  # pad address to 32 bytes
+                        "0x" + self.account.address[2:].zfill(64)  # Make sure this has 0x prefix too
                     ]
                 })
 
