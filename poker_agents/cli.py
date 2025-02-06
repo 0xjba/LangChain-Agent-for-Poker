@@ -13,8 +13,9 @@ from .timer_agent import TimerAgent
 from typing import Dict, Optional
 
 from .agent import PokerAgent
-from .constants import CONFIG_DIR, PROFILES_FILE, CURRENT_SESSION, SessionConfig
+from .constants import CONFIG_DIR, PROFILES_FILE, CONFIG_FILE, CURRENT_SESSION, SessionConfig
 from .openrouter_client import OpenRouterClient
+from .config_manager import ConfigManager
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -90,6 +91,111 @@ class PokerAgentCLI:
             CURRENT_SESSION.router_address = contract_config['router']
             CURRENT_SESSION.state_storage_address = contract_config['state_storage']
             CURRENT_SESSION.game_logic_address = contract_config['game_logic']
+
+    async def start_from_config(self, config: dict):
+        """Start agents from configuration"""
+        try:
+            print("\nStarting in non-interactive mode...")
+            print("Checking configuration...")
+
+            # Set contract addresses
+            if contracts := config.get('contracts'):
+                if not all([contracts['router'], contracts['state_storage'], contracts['game_logic']]):
+                    print("Missing contract addresses in config or environment variables")
+                    print("Available addresses:")
+                    print(f"Router: {contracts['router'] or 'Not set'}")
+                    print(f"StateStorage: {contracts['state_storage'] or 'Not set'}")
+                    print(f"GameLogic: {contracts['game_logic'] or 'Not set'}")
+                    return
+                
+                CURRENT_SESSION.router_address = contracts['router']
+                CURRENT_SESSION.state_storage_address = contracts['state_storage']
+                CURRENT_SESSION.game_logic_address = contracts['game_logic']
+                print("\nContract addresses loaded:")
+                print(f"Router: {contracts['router']}")
+                print(f"StateStorage: {contracts['state_storage']}")
+                print(f"GameLogic: {contracts['game_logic']}")
+            else:
+                print("No contract addresses found in config")
+                return
+
+            # Start timer agent if configured
+            if timer_config := config.get('timer_agent'):
+                if all([timer_config['rpc_url'], timer_config['private_key']]):
+                    print("\nStarting Timer Agent...")
+                    timer_agent = TimerAgent()
+                    success = await timer_agent.initialize(
+                        rpc_url=timer_config['rpc_url'],
+                        private_key=timer_config['private_key'],
+                        router_address=CURRENT_SESSION.router_address,
+                        game_logic_address=CURRENT_SESSION.game_logic_address
+                    )
+                    if success:
+                        self.timer_agent = timer_agent
+                        asyncio.create_task(timer_agent.start())
+                        print("✓ Timer Agent started successfully")
+                    else:
+                        print("✗ Failed to start Timer Agent")
+                else:
+                    print("Timer Agent configuration incomplete")
+
+            # Start configured agents
+            if agents_config := config.get('agents'):
+                print("\nStarting configured agents...")
+                for name, agent_env in agents_config.items():
+                    rpc_url = os.getenv(agent_env['rpc_url'])
+                    private_key = os.getenv(agent_env['private_key'])
+                    model = os.getenv(agent_env.get('model'), "anthropic/claude-2")
+
+                    print(f"\nAgent: {name}")
+                    print(f"Model: {model}")
+                    print(f"RPC URL env var: {agent_env['rpc_url']}")
+                    if all([rpc_url, private_key]):
+                        print("Starting agent...")
+                        agent = PokerAgent(model_name=model)
+                        success = await agent.initialize(
+                            rpc_url=rpc_url,
+                            private_key=private_key,
+                            router_address=CURRENT_SESSION.router_address,
+                            state_storage_address=CURRENT_SESSION.state_storage_address,
+                            game_logic_address=CURRENT_SESSION.game_logic_address
+                        )
+                        if success:
+                            print(f"✓ Agent {name} started successfully")
+                            self.active_agents[name] = agent
+                            asyncio.create_task(self._run_agent(name, name, agent))
+                        else:
+                            print(f"✗ Failed to start agent {name}")
+                    else:
+                        print("✗ Missing environment variables for agent")
+                        if not rpc_url:
+                            print(f"Missing RPC URL (env var: {agent_env['rpc_url']})")
+                        if not private_key:
+                            print(f"Missing private key (env var: {agent_env['private_key']})")
+            else:
+                print("\nNo agents configured")
+
+            if not self.active_agents and not self.timer_agent:
+                print("\nNo agents or timer started. Check configuration and environment variables.")
+                return
+
+            print("\nSystem running. Press Ctrl+C to stop.")
+            
+            # Keep running until interrupted
+            while self.running:
+                # Print periodic status
+                if self.active_agents or self.timer_agent:
+                    await asyncio.sleep(30)  # Status update every 30 seconds
+                    print("\nCurrent Status:")
+                    if self.timer_agent:
+                        print("Timer Agent: Running")
+                    print(f"Active Agents: {len(self.active_agents)}")
+                else:
+                    await asyncio.sleep(1)
+
+        except Exception as e:
+            logger.error(f"Error starting from config: {e}")
+            raise     
 
     async def setup_timer_agent(self):
         """Set up and start the timer agent"""
@@ -596,10 +702,17 @@ class PokerAgentCLI:
             ).ask_async()
         return True
 
-async def main():
+async def main(interactive: bool = False):
     cli = PokerAgentCLI()
     try:
-        await cli.main_menu()
+        if interactive:
+            await cli.main_menu()
+        else:
+            config = cli.config_manager.load_config()
+            if not config.get('contracts'):
+                print("No configuration found. Run with --interactive to set up.")
+                return
+            await cli.start_from_config(config)
     except KeyboardInterrupt:
         if cli.active_agents:
             print("\nStopping all agents...")
