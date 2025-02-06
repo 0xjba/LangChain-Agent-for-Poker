@@ -105,7 +105,7 @@ class TimerAgent:
             logger.error(f"Error processing timeout for {player_address}: {e}")
 
     async def monitor_events(self):
-        """Monitor for ActionTimerStarted events"""
+        """Monitor contract events for turns using getLogs"""
         while self.is_running:
             try:
                 # Get latest block number
@@ -113,27 +113,29 @@ class TimerAgent:
                 from_block = max(0, latest_block - 10)  # Look back 10 blocks
 
                 # Event signature for ActionTimerStarted
-                event_signature = self.web3.keccak(
+                event_signature = '0x' + self.web3.keccak(
                     text="ActionTimerStarted(address,uint256,uint256)"
                 ).hex()
                 
-                # Get logs
+                # Get logs directly
                 logs = self.web3.eth.get_logs({
                     'address': self.game_logic.address,
                     'fromBlock': from_block,
                     'toBlock': 'latest',
-                    'topics': [event_signature]
+                    'topics': [
+                        event_signature,
+                        '0x' + self.account.address[2:].zfill(64)  # Ensure 0x prefix
+                    ]
                 })
 
-                # Process logs
+                # Process any logs found
                 for log in logs:
-                    decoded_log = self.game_logic.events.ActionTimerStarted().process_log(log)
-                    player = decoded_log['args']['player']
-                    duration = decoded_log['args']['duration']
-                    
-                    # Set timer
-                    self.active_timers[player] = datetime.now() + timedelta(seconds=duration)
-                    logger.info(f"Timer started for {player}, duration: {duration}s")
+                    # Process the log data
+                    topics = log['topics']
+                    player_address = self.web3.to_checksum_address(topics[1][-40:])  # last 20 bytes
+                    if player_address == self.account.address:
+                        logger.info(f"Turn event detected: Block {log['blockNumber']}")
+                        await self.process_turn()
 
             except Exception as e:
                 logger.error(f"Error monitoring events: {e}")
