@@ -156,7 +156,7 @@ class PokerAgent:
 
             # Sign and send transaction
             signed_tx = self.web3.eth.account.sign_transaction(tx, self.account.key)
-            tx_hash = self.web3.eth.send_raw_transaction(signed_tx.rawTransaction)
+            tx_hash = self.web3.eth.send_raw_transaction(signed_tx.raw_transaction)
             
             # Wait for transaction receipt
             receipt = self.web3.eth.wait_for_transaction_receipt(tx_hash)
@@ -310,7 +310,7 @@ class PokerAgent:
 
     async def _count_active_players(self) -> int:
         """Count number of active players"""
-        tournament_state = await self.state_storage.getTournamentStateValues()
+        tournament_state = self.state_storage.functions.getTournamentStateValues().call()
         return tournament_state[7]  # activePlayerCount
 
     async def _get_previous_actions(self) -> List[str]:
@@ -321,7 +321,7 @@ class PokerAgent:
 
     async def _get_tournament_stage(self) -> str:
         """Get current tournament stage information"""
-        tournament_state = await self.state_storage.getTournamentStateValues()
+        tournament_state = self.state_storage.functions.getTournamentStateValues().call()
         return f"Level {tournament_state[10]}, Blinds: {tournament_state[0]}/{tournament_state[1]}"
 
     def _is_valid_action(self, action_type: int, amount: int, 
