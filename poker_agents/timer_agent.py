@@ -116,6 +116,7 @@ class TimerAgent:
                 event_signature = '0x' + self.web3.keccak(
                     text="ActionTimerStarted(address,uint256,uint256)"
                 ).hex()
+                event_signature = self.web3.to_hex(hexstr=event_signature)
                 
                 # Get logs directly
                 logs = self.web3.eth.get_logs({

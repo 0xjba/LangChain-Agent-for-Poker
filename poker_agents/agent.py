@@ -432,6 +432,12 @@ class PokerAgent:
                 event_signature = '0x' + self.web3.keccak(
                     text="ActionTimerStarted(address,uint256,uint256)"
                 ).hex()
+                event_signature = self.web3.to_hex(hexstr=event_signature)
+
+                # Format player address as topic
+                player_topic = self.web3.to_hex(
+                    hexstr=self.account.address[2:].zfill(64)
+                )
                 
                 # Get logs
                 logs = self.web3.eth.get_logs({
