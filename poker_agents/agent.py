@@ -143,6 +143,9 @@ class PokerAgent:
             else:
                 data = b''
 
+            # Get current gas price with a multiplier for faster confirmation
+            gas_price = int(self.web3.eth.gas_price * 1.2)  # 20% higher gas price
+
             # Build transaction
             tx = self.router.functions.routeGameAction(
                 action_type,
@@ -150,16 +153,22 @@ class PokerAgent:
             ).build_transaction({
                 'from': self.account.address,
                 'nonce': self.web3.eth.get_transaction_count(self.account.address),
-                'gas': 200000,  # Estimate this
-                'gasPrice': self.web3.eth.gas_price
+                'gas': 300000,  # Increased gas limit
+                'gasPrice': gas_price,
+                'maxFeePerGas': gas_price * 2,  # For EIP-1559 networks
+                'maxPriorityFeePerGas': int(gas_price * 0.5)  # For EIP-1559 networks
             })
 
             # Sign and send transaction
             signed_tx = self.web3.eth.account.sign_transaction(tx, self.account.key)
             tx_hash = self.web3.eth.send_raw_transaction(signed_tx.raw_transaction)
             
-            # Wait for transaction receipt
-            receipt = self.web3.eth.wait_for_transaction_receipt(tx_hash)
+            # Wait for transaction with increased timeout and confirmation checks
+            receipt = self.web3.eth.wait_for_transaction_receipt(
+                tx_hash,
+                timeout=180,  # Increased timeout
+                poll_latency=2  # Check every 2 seconds
+            )
             
             if receipt['status'] == 1:
                 logger.info(f"Action completed: type={action_type}, amount={amount}")
@@ -169,7 +178,7 @@ class PokerAgent:
                 return False
 
         except Exception as e:
-            logger.error(f"Error making action: {e}")
+            logger.error(f"Error making action: {e}", exc_info=True)  # Added stack trace
             return False
 
     async def get_game_state(self) -> GameState:
@@ -259,39 +268,92 @@ class PokerAgent:
                 logger.debug(f"Turn {turn_id} already processed")
                 return
 
-            # Get LLM decision
-            response = self.llm.get_completion(messages)
+            # Keep trying until we get a valid decision
+            max_attempts = 3
+            attempt = 0
+            while attempt < max_attempts:
+                attempt += 1
+                try:
+                    response = self.llm.get_completion(messages)
+                    response = response.strip()
+                    
+                    # Try to clean the response
+                    if response.startswith("```json"):
+                        response = response.split("```json")[1]
+                    if response.endswith("```"):
+                        response = response.split("```")[0]
+                    
+                    decision = json.loads(response.strip())
+                    
+                    # Validate decision has required fields
+                    if not all(k in decision for k in ['action', 'reasoning']):
+                        logger.info(f"Attempt {attempt}: Missing required fields")
+                        continue
+                    
+                    if decision['action'] not in [0, 1, 2, 3]:
+                        logger.info(f"Attempt {attempt}: Invalid action type")
+                        continue
+                    
+                    # If we get here, we have a valid decision
+                    logger.info(f"Valid decision on attempt {attempt}: {decision['reasoning']}")
+                    
+                    action_type = decision['action']
+                    amount = decision.get('amount', 0)
+                    
+                    if not self._is_valid_action(action_type, amount, game_state, player_state):
+                        logger.info(f"Attempt {attempt}: Action not valid in current state")
+                        continue
+                    
+                    # Valid decision and action, execute it
+                    await self.make_action(action_type, amount)
+                    
+                    # Record this turn as processed
+                    self.processed_turns.add(turn_id)
+                    self.last_action_time = datetime.now()
+
+                    # Keep processed turns set from growing too large
+                    if len(self.processed_turns) > 1000:
+                        self.processed_turns = set(list(self.processed_turns)[-500:])
+                    
+                    return  # Success! Exit the loop
+                    
+                except json.JSONDecodeError:
+                    logger.info(f"Attempt {attempt}: Invalid JSON response")
+                    continue
+                except Exception as e:
+                    logger.error(f"Attempt {attempt}: Unexpected error: {e}")
+                    continue
+                
+                await asyncio.sleep(1)  # Small delay between attempts
             
-            try:
-                decision = json.loads(response)
-                logger.info(f"Decision reasoning: {decision['reasoning']} (Confidence: {decision.get('confidence', 0)}%)")
-                
-                # Validate and execute decision
-                action_type = decision['action']
-                amount = decision.get('amount', 0)
-                
-                if not self._is_valid_action(action_type, amount, game_state, player_state):
-                    logger.warning("LLM suggested invalid action, defaulting to FOLD")
-                    await self.make_action(0)
-                    return
+            # If we get here, we failed to get a valid decision after max attempts
+            logger.warning(f"Failed to get valid decision after {max_attempts} attempts.")
 
-                await self.make_action(action_type, amount)
-                
-                # Record this turn as processed
-                self.processed_turns.add(turn_id)
-                self.last_action_time = datetime.now()
-
-                # Keep processed turns set from growing too large
-                if len(self.processed_turns) > 1000:
-                    self.processed_turns = set(list(self.processed_turns)[-500:])
-                
-            except (json.JSONDecodeError, KeyError) as e:
-                logger.error(f"Failed to parse LLM response: {e}")
-                await self.make_action(0)
+            # Check if there's a bet to call
+            current_bet = game_state.current_bet
+            our_bet = player_state.current_bet
+            
+            if current_bet > our_bet:
+                # Someone has bet/raised, we need to fold
+                logger.info("Bet to call exists, defaulting to FOLD")
+                await self.make_action(0)  # FOLD
+            else:
+                # No bet to call, we can check
+                logger.info("No bet to call, defaulting to CHECK")
+                await self.make_action(1)  # CHECK
 
         except Exception as e:
-            logger.error(f"Error in turn handling: {e}")
-            await self.make_action(0)
+                    logger.error(f"Error in turn handling: {e}")
+                    # Check if there's a bet to call
+                    current_bet = game_state.current_bet
+                    our_bet = player_state.current_bet
+                    
+                    if current_bet > our_bet:
+                        logger.info("Bet to call exists, defaulting to FOLD")
+                        await self.make_action(0)
+                    else:
+                        logger.info("No bet to call, defaulting to CHECK")
+                        await self.make_action(1)
 
     def _format_cards(self, cards: List[int]) -> str:
         """Format cards into readable strings"""
