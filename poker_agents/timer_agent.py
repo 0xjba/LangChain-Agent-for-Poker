@@ -112,28 +112,31 @@ class TimerAgent:
                 latest_block = self.web3.eth.block_number
                 from_block = max(0, latest_block - 10)  # Look back 10 blocks
 
-                # Event signature for ActionTimerStarted
-                event_signature = '0x' + self.web3.keccak(
+                # Get event signature (ensuring 0x prefix)
+                event_signature = self.web3.keccak(
                     text="ActionTimerStarted(address,uint256,uint256)"
                 ).hex()
-                event_signature = self.web3.to_hex(hexstr=event_signature)
-                
-                # Get logs directly
+                if not event_signature.startswith('0x'):
+                    event_signature = '0x' + event_signature
+
+                # Format player address as 32-byte topic (ensuring 0x prefix)
+                player_topic = '0x' + self.account.address[2:].rjust(64, '0')
+
+                # Get logs
                 logs = self.web3.eth.get_logs({
                     'address': self.game_logic.address,
                     'fromBlock': from_block,
                     'toBlock': 'latest',
                     'topics': [
                         event_signature,
-                        '0x' + self.account.address[2:].zfill(64)  # Ensure 0x prefix
+                        player_topic
                     ]
                 })
 
-                # Process any logs found
+                # Process logs
                 for log in logs:
-                    # Process the log data
                     topics = log['topics']
-                    player_address = self.web3.to_checksum_address(topics[1][-40:])  # last 20 bytes
+                    player_address = self.web3.to_checksum_address(topics[1][-40:])
                     if player_address == self.account.address:
                         logger.info(f"Turn event detected: Block {log['blockNumber']}")
                         await self.process_turn()
