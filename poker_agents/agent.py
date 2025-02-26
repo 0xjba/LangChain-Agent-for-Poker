@@ -13,6 +13,7 @@ import json
 import os
 from datetime import datetime
 from enum import IntEnum
+from eth_abi import encode
 from .openrouter_client import OpenRouterClient
 
 logger = logging.getLogger(__name__)
@@ -54,12 +55,16 @@ class PlayerState:
 
 class PokerAgent:
     def __init__(self, model_name: str = "anthropic/claude-2"):
+        # Existing initialization...
         self.is_running = False
-        # Track turns we've already acted on to prevent duplicates
         self.processed_turns = set()
         self.last_action_time = None
-        # Minimum time between actions (in seconds)
         self.MIN_ACTION_INTERVAL = 2
+        
+        # Add tracking variables for hand investment
+        self.current_hand_investment = 0
+        self.current_hand_id = None
+        self.action_history = []
         
         # Initialize OpenRouter client
         self.llm = OpenRouterClient(model_name=model_name)
@@ -68,7 +73,8 @@ class PokerAgent:
         self.system_prompt = (
             "You are an expert poker player making strategic decisions. "
             "Analyze the situation and choose the best action: FOLD (0), CHECK (1), CALL (2), or RAISE (3). "
-            "If raising, also specify the raise amount.\n\n"
+            "If raising, specify the raise amount. "
+            "Respond **only** with a valid JSON object, no additional text or markdown. "
             "Consider:\n"
             "- Pot odds and implied odds\n"
             "- Position and table dynamics\n"
@@ -79,7 +85,7 @@ class PokerAgent:
             "Response format (JSON):\n"
             "{\n"
             '    "action": 0-3,\n'
-            '    "amount": raise_amount (optional, only if action is 3),\n'
+            '    "amount": raise_amount,  // optional, only if action is 3\n'
             '    "reasoning": "detailed explanation of the decision",\n'
             '    "confidence": 0-100\n'
             "}"
@@ -92,8 +98,9 @@ class PokerAgent:
         try:
             # Initialize Web3 and account
             self.web3 = Web3(Web3.HTTPProvider(rpc_url))
+
             self.account = self.web3.eth.account.from_key(private_key)
-            
+
             # Load contract ABIs
             with open('abis/Router.json', 'r') as f:
                 router_abi = json.load(f)
@@ -137,49 +144,190 @@ class PokerAgent:
     async def make_action(self, action_type: int, amount: int = 0) -> bool:
         """Execute poker action through Router contract"""
         try:
-            # Prepare transaction data
-            if action_type == 3:  # Raise
-                data = self.web3.eth.abi.encode_abi(['uint256'], [amount])
-            else:
-                data = b''
+            # Get the current game state to calculate investment
+            game_state = await self.get_game_state()
+            player_state = await self.get_player_state(self.account.address)
+            
+            # Calculate investment based on action type
+            investment = 0
+            
+            if action_type == 2:  # CALL
+                investment = game_state.current_bet - player_state.current_bet
+            elif action_type == 3:  # RAISE
+                call_amount = max(0, game_state.current_bet - player_state.current_bet)
+                investment = call_amount + amount
+            
+            # Get base fee and priority fee for EIP-1559
+            latest_block = self.web3.eth.get_block('latest')
+            base_fee = latest_block['baseFeePerGas']
+            priority_fee = self.web3.eth.max_priority_fee
 
-            # Get current gas price with a multiplier for faster confirmation
-            gas_price = int(self.web3.eth.gas_price * 1.2)  # 20% higher gas price
-
+            # Calculate maxFeePerGas (cap on total gas fee)
+            max_fee_per_gas = int(base_fee * 1.5) + priority_fee
+            max_priority_fee_per_gas = priority_fee
+            
+            # For FOLD and CHECK, we can pass empty bytes
+            if action_type == 0 or action_type == 1:  # FOLD or CHECK
+                # Use a separate method to build the transaction data
+                function_data = self.router.encodeABI(fn_name="routeGameAction", args=[action_type, b''])
+            else:  # CALL or RAISE
+                # For RAISE, include the amount
+                if action_type == 3:
+                    # For RAISE, encode the amount as bytes
+                    amount_hex = hex(amount)[2:].zfill(64)  # Convert to hex and pad to 32 bytes
+                    data = bytes.fromhex(amount_hex)
+                    function_data = self.router.encodeABI(fn_name="routeGameAction", args=[action_type, data])
+                else:
+                    # For CALL, use empty bytes
+                    function_data = self.router.encodeABI(fn_name="routeGameAction", args=[action_type, b''])
+            
             # Build transaction
-            tx = self.router.functions.routeGameAction(
-                action_type,
-                data
-            ).build_transaction({
+            tx = {
                 'from': self.account.address,
-                'nonce': self.web3.eth.get_transaction_count(self.account.address),
-                'gas': 300000,  # Increased gas limit
-                'gasPrice': gas_price,
-                'maxFeePerGas': gas_price * 2,  # For EIP-1559 networks
-                'maxPriorityFeePerGas': int(gas_price * 0.5)  # For EIP-1559 networks
-            })
+                'to': self.router.address,
+                'gas': 300000,
+                'maxFeePerGas': max_fee_per_gas,
+                'maxPriorityFeePerGas': max_priority_fee_per_gas,
+                'chainId': self.web3.eth.chain_id,
+                'data': function_data,
+                'value': 0
+            }
+            
+            # Rest of function remains the same with retry logic
+            max_attempts = 3
+            base_delay = 2
+            
+            for attempt in range(max_attempts):
+                try:
+                    # Verification code
+                    current_game_state = await self.get_game_state()
+                    current_player_state = await self.get_player_state(self.account.address)
+                    
+                    logger.info(f"Pre-transaction validation - Current turn: {current_game_state.current_turn}")
+                    logger.info(f"My address: {self.account.address}")
+                    logger.info(f"My player state: Status={current_player_state.status}, Position={current_player_state.position}")
+                    logger.info(f"Game state: Round={current_game_state.current_round}, CurrentBet={current_game_state.current_bet}")
+                    
+                    if current_game_state.current_turn.lower() != self.account.address.lower():
+                        logger.warning("No longer my turn - aborting action")
+                        return False
+                        
+                    # Update nonce for each attempt
+                    tx['nonce'] = self.web3.eth.get_transaction_count(self.account.address)
+                    
+                    # Log transaction details before sending
+                    logger.info(f"Sending transaction: Action={action_type}, Data={function_data}")
+                    logger.info(f"Transaction details: {tx}")
+                    
+                    # Sign and send transaction
+                    signed_tx = self.web3.eth.account.sign_transaction(tx, self.account.key)
+                    tx_hash = self.web3.eth.send_raw_transaction(signed_tx.rawTransaction)
+                    
+                    logger.info(f"Transaction sent: {tx_hash.hex()}")
+                    
+                    # Wait for transaction confirmation
+                    receipt = self.web3.eth.wait_for_transaction_receipt(
+                        tx_hash,
+                        timeout=60,
+                        poll_latency=2
+                    )
+                    
+                    if receipt['status'] == 1:
+                        # Success handling
+                        self.current_hand_investment += investment
+                        
+                        self.action_history.append({
+                            'type': ['FOLD', 'CHECK', 'CALL', 'RAISE'][action_type],
+                            'amount': investment,
+                            'time': datetime.now().isoformat()
+                        })
+                        
+                        logger.info(f"Action completed: type={action_type}, investment={investment}, "
+                                f"total_investment={self.current_hand_investment}, tx_hash={tx_hash.hex()}")
+                        return True
+                    else:
+                        # Transaction failed - capture more details
+                        logger.error(f"Transaction failed: tx_hash={tx_hash.hex()}")
+                        
+                        # Specific error checking
+                        # 1. Check if you're authorized
+                        try:
+                            is_whitelisted = self.router.functions.isWhitelisted(self.account.address).call()
+                            logger.info(f"Player whitelisted status: {is_whitelisted}")
+                        except Exception as e:
+                            logger.error(f"Failed to check whitelist status: {e}")
+                        
+                        # 2. Check valid actions
+                        try:
+                            valid_actions = await self.get_valid_actions(game_state, player_state)
+                            logger.info(f"Valid actions: FOLD={valid_actions[0]}, CHECK={valid_actions[1]}, CALL={valid_actions[2]}, RAISE={valid_actions[3]}")
+                        except Exception as e:
+                            logger.error(f"Failed to get valid actions: {e}")
+                        
+                        # Try to get revert reason
+                        try:
+                            tx_data = self.web3.eth.get_transaction(tx_hash)
+                            result = self.web3.eth.call({
+                                'to': tx_data['to'],
+                                'from': tx_data['from'],
+                                'data': tx_data['input'],
+                                'value': tx_data.get('value', 0),
+                                'gas': tx_data['gas'],
+                                'gasPrice': tx_data.get('gasPrice', tx_data.get('maxFeePerGas', 0))
+                            }, block_identifier=receipt.blockNumber)
+                            logger.error(f"Transaction call result: {result}")
+                        except Exception as e:
+                            logger.error(f"Failed to get revert reason: {e}")
+                            
+                        logger.error(f"Transaction receipt details: {receipt}")
+                        
+                        # Get updated game state after failure
+                        try:
+                            post_game_state = await self.get_game_state()
+                            logger.info(f"Game state after failed tx: Turn={post_game_state.current_turn}, " 
+                                    f"Round={post_game_state.current_round}, Bet={post_game_state.current_bet}")
+                        except Exception as e:
+                            logger.error(f"Failed to get post-tx game state: {e}")
+                        
+                        if attempt < max_attempts - 1:
+                            delay = base_delay * (2 ** attempt)
+                            logger.info(f"Retrying in {delay}s (attempt {attempt+1}/{max_attempts})")
+                            await asyncio.sleep(delay)
+                        else:
+                            return False
+                except Exception as e:
+                    logger.error(f"Error in transaction attempt {attempt+1}: {e}")
+                    if attempt < max_attempts - 1:
+                        delay = base_delay * (2 ** attempt)
+                        logger.info(f"Retrying in {delay}s (attempt {attempt+1}/{max_attempts})")
+                        await asyncio.sleep(delay)
+                    else:
+                        logger.error(f"All {max_attempts} attempts failed, giving up.")
+                        raise
 
-            # Sign and send transaction
-            signed_tx = self.web3.eth.account.sign_transaction(tx, self.account.key)
-            tx_hash = self.web3.eth.send_raw_transaction(signed_tx.raw_transaction)
-            
-            # Wait for transaction with increased timeout and confirmation checks
-            receipt = self.web3.eth.wait_for_transaction_receipt(
-                tx_hash,
-                timeout=180,  # Increased timeout
-                poll_latency=2  # Check every 2 seconds
-            )
-            
-            if receipt['status'] == 1:
-                logger.info(f"Action completed: type={action_type}, amount={amount}")
-                return True
-            else:
-                logger.error("Transaction failed")
-                return False
+            return False
 
         except Exception as e:
-            logger.error(f"Error making action: {e}", exc_info=True)  # Added stack trace
+            logger.error(f"Error making action: {e}", exc_info=True)
             return False
+
+    async def _check_blinds(self, game_state: GameState, player_state: PlayerState):
+        """Check if the player posted blinds in this hand and update investment"""
+        # If this is preflop and player has a current bet but we haven't tracked investment
+        if (game_state.current_round == BettingRound.PREFLOP and 
+                player_state.current_bet > 0 and 
+                self.current_hand_investment == 0):
+            
+            # This is likely a blind
+            self.current_hand_investment = player_state.current_bet
+            logger.info(f"Detected blind: {player_state.current_bet}")
+            
+            # Add to action history
+            self.action_history.append({
+                'type': 'BLIND',
+                'amount': player_state.current_bet,
+                'time': datetime.now().isoformat()
+            })    
 
     async def get_game_state(self) -> GameState:
         """Get current game state from StateStorage"""
@@ -218,6 +366,16 @@ class PokerAgent:
             logger.error(f"Error getting player state: {e}")
             raise
 
+    def _is_new_hand(self, game_state: GameState) -> bool:
+        """Detect if this is a new hand based on hand_start_time"""
+        new_hand_id = game_state.hand_start_time
+        
+        if self.current_hand_id != new_hand_id:
+            logger.info(f"New hand detected. Previous: {self.current_hand_id}, New: {new_hand_id}")
+            self.current_hand_id = new_hand_id
+            return True
+        return False    
+
     async def handle_turn(self, game_state: GameState, player_state: PlayerState):
         """Handle player's turn using LLM for decision making"""
         try:
@@ -225,6 +383,9 @@ class PokerAgent:
                 logger.debug("Skipping turn - too soon after last action")
                 return
 
+            # Check for blinds to track investment
+            await self._check_blinds(game_state, player_state)
+            
             # Get additional game information
             active_players = await self._count_active_players()
             previous_actions = await self._get_previous_actions()
@@ -234,20 +395,30 @@ class PokerAgent:
             hole_cards = self._format_cards(player_state.hole_cards)
             community_cards = self._format_cards(game_state.community_cards)
 
-            # Format game state message
+            # Format game state message with investment information
             game_state_message = (
                 f"Game State:\n"
                 f"Hand: {hole_cards}\n"
                 f"Community Cards: {community_cards}\n"
                 f"Current Bet: {game_state.current_bet}\n"
+                f"Your Current Bet: {player_state.current_bet}\n"
+                f"Amount to Call: {max(0, game_state.current_bet - player_state.current_bet)}\n"
                 f"Your Stack: {player_state.stack}\n"
+                f"Your Investment This Hand: {self.current_hand_investment}\n"
                 f"Pot Size: {game_state.main_pot}\n"
                 f"Position: {player_state.position}\n"
                 f"Active Players: {active_players}\n"
                 f"Previous Actions: {previous_actions}\n"
-                f"Current Round: {game_state.current_round}\n"
+                f"Current Round: {game_state.current_round.name}\n"
                 f"Tournament Stage: {tournament_stage}"
             )
+
+            # Add action history if available
+            if self.action_history:
+                action_summary = "\n\nYour actions this hand:\n"
+                for action in self.action_history:
+                    action_summary += f"- {action['type']}: {action['amount']} chips\n"
+                game_state_message += action_summary
 
             # Create the messages array for OpenRouter
             messages = [
@@ -268,13 +439,27 @@ class PokerAgent:
                 logger.debug(f"Turn {turn_id} already processed")
                 return
 
-            # Keep trying until we get a valid decision
+            # ======= ENHANCED ERROR HANDLING FOR LLM RESPONSES =======
+            # Variables to track decision validity
+            valid_decision = False
+            decision = None
             max_attempts = 3
             attempt = 0
-            while attempt < max_attempts:
+            error_message = None
+            
+            # Calculate valid actions
+            can_fold = True
+            can_check = (game_state.current_bet == 0 or player_state.current_bet == game_state.current_bet)
+            can_call = (player_state.stack >= game_state.current_bet - player_state.current_bet)
+            min_raise = game_state.current_bet * 2
+            can_raise = (player_state.stack >= min_raise)
+            
+            while attempt < max_attempts and not valid_decision:
                 attempt += 1
                 try:
+                    # Get LLM response
                     response = self.llm.get_completion(messages)
+                    logger.debug(f"Raw LLM response: {response}")
                     response = response.strip()
                     
                     # Try to clean the response
@@ -283,77 +468,132 @@ class PokerAgent:
                     if response.endswith("```"):
                         response = response.split("```")[0]
                     
-                    decision = json.loads(response.strip())
-                    
-                    # Validate decision has required fields
-                    if not all(k in decision for k in ['action', 'reasoning']):
-                        logger.info(f"Attempt {attempt}: Missing required fields")
+                    # Try to parse JSON
+                    try:
+                        decision = json.loads(response.strip())
+                        logger.debug(f"Parsed decision: {decision}")
+                        
+                        # Validate decision has required fields
+                        if not all(k in decision for k in ['action', 'reasoning']):
+                            error_message = f"Attempt {attempt}: Missing required fields"
+                            logger.info(error_message)
+                            continue
+                        
+                        # Validate action type
+                        action_type = decision['action']
+                        if action_type not in [0, 1, 2, 3]:
+                            error_message = f"Attempt {attempt}: Invalid action type {action_type}"
+                            logger.info(error_message)
+                            continue
+                        
+                        # Check if action is valid in current game state
+                        action_map = {0: can_fold, 1: can_check, 2: can_call, 3: can_raise}
+                        action_names = {0: "FOLD", 1: "CHECK", 2: "CALL", 3: "RAISE"}
+                        
+                        if not action_map[action_type]:
+                            error_message = f"Attempt {attempt}: Action {action_names[action_type]} not valid in current state"
+                            logger.info(error_message)
+                            continue
+                        
+                        # For raises, validate amount
+                        if action_type == 3:
+                            if 'amount' not in decision:
+                                error_message = f"Attempt {attempt}: Raise action missing amount"
+                                logger.info(error_message)
+                                continue
+                                
+                            raise_amount = decision['amount']
+                            if not isinstance(raise_amount, (int, float)) or raise_amount <= 0:
+                                error_message = f"Attempt {attempt}: Invalid raise amount {raise_amount}"
+                                logger.info(error_message)
+                                continue
+                                
+                            # Convert to int if float
+                            if isinstance(raise_amount, float):
+                                raise_amount = int(raise_amount)
+                                decision['amount'] = raise_amount
+                                
+                            # Check min raise and stack constraints
+                            call_amount = game_state.current_bet - player_state.current_bet
+                            total_amount = call_amount + raise_amount
+                            
+                            if raise_amount < min_raise:
+                                error_message = f"Attempt {attempt}: Raise amount {raise_amount} below minimum {min_raise}"
+                                logger.info(error_message)
+                                continue
+                                
+                            if total_amount > player_state.stack:
+                                error_message = f"Attempt {attempt}: Total amount {total_amount} exceeds stack {player_state.stack}"
+                                logger.info(error_message)
+                                continue
+                        
+                        # If we get here, decision is valid
+                        valid_decision = True
+                        logger.info(f"Valid decision on attempt {attempt}: {decision['reasoning']}")
+                        
+                    except json.JSONDecodeError:
+                        error_message = f"Attempt {attempt}: Invalid JSON response"
+                        logger.info(error_message)
                         continue
-                    
-                    if decision['action'] not in [0, 1, 2, 3]:
-                        logger.info(f"Attempt {attempt}: Invalid action type")
-                        continue
-                    
-                    # If we get here, we have a valid decision
-                    logger.info(f"Valid decision on attempt {attempt}: {decision['reasoning']}")
-                    
-                    action_type = decision['action']
-                    amount = decision.get('amount', 0)
-                    
-                    if not self._is_valid_action(action_type, amount, game_state, player_state):
-                        logger.info(f"Attempt {attempt}: Action not valid in current state")
-                        continue
-                    
-                    # Valid decision and action, execute it
-                    await self.make_action(action_type, amount)
-                    
-                    # Record this turn as processed
-                    self.processed_turns.add(turn_id)
-                    self.last_action_time = datetime.now()
-
-                    # Keep processed turns set from growing too large
-                    if len(self.processed_turns) > 1000:
-                        self.processed_turns = set(list(self.processed_turns)[-500:])
-                    
-                    return  # Success! Exit the loop
-                    
-                except json.JSONDecodeError:
-                    logger.info(f"Attempt {attempt}: Invalid JSON response")
-                    continue
+                        
                 except Exception as e:
-                    logger.error(f"Attempt {attempt}: Unexpected error: {e}")
+                    error_message = f"Attempt {attempt}: Unexpected error: {e}"
+                    logger.error(error_message)
                     continue
                 
-                await asyncio.sleep(1)  # Small delay between attempts
+                # Small delay between attempts
+                if not valid_decision and attempt < max_attempts:
+                    await asyncio.sleep(1)
             
-            # If we get here, we failed to get a valid decision after max attempts
-            logger.warning(f"Failed to get valid decision after {max_attempts} attempts.")
-
-            # Check if there's a bet to call
-            current_bet = game_state.current_bet
-            our_bet = player_state.current_bet
-            
-            if current_bet > our_bet:
-                # Someone has bet/raised, we need to fold
-                logger.info("Bet to call exists, defaulting to FOLD")
-                await self.make_action(0)  # FOLD
+            # ======= INTELLIGENT FALLBACK STRATEGY =======
+            # If we couldn't get a valid decision after max attempts, use a strategic fallback
+            # If we couldn't get a valid decision after max attempts, use a simple fallback
+            if not valid_decision:
+                logger.warning(f"Failed to get valid decision after {max_attempts} attempts.")
+                
+                if can_check:
+                    # If we can check, always check
+                    logger.info("Fallback: Using CHECK")
+                    action_type = 1  # CHECK
+                    amount = 0
+                else:
+                    # Otherwise fold
+                    logger.info("Fallback: Using FOLD")
+                    action_type = 0  # FOLD
+                    amount = 0
             else:
-                # No bet to call, we can check
-                logger.info("No bet to call, defaulting to CHECK")
-                await self.make_action(1)  # CHECK
-
+                # Use the valid decision from LLM
+                action_type = decision['action']
+                amount = decision.get('amount', 0)
+            
+            # Execute the action
+            success = await self.make_action(action_type, amount)
+            
+            if success:
+                logger.info(f"Successfully executed action: {action_type} with amount {amount}")
+                # Record this turn as processed
+                self.processed_turns.add(turn_id)
+                self.last_action_time = datetime.now()
+                
+                # Keep processed turns set from growing too large
+                if len(self.processed_turns) > 1000:
+                    self.processed_turns = set(list(self.processed_turns)[-500:])
+            else:
+                logger.error(f"Failed to execute action: {action_type} with amount {amount}")
+                
         except Exception as e:
-                    logger.error(f"Error in turn handling: {e}")
-                    # Check if there's a bet to call
-                    current_bet = game_state.current_bet
-                    our_bet = player_state.current_bet
-                    
-                    if current_bet > our_bet:
-                        logger.info("Bet to call exists, defaulting to FOLD")
-                        await self.make_action(0)
-                    else:
-                        logger.info("No bet to call, defaulting to CHECK")
-                        await self.make_action(1)
+            logger.error(f"Error in turn handling: {e}")
+            # Emergency fallback - if we can check, do that, otherwise fold
+            try:
+                game_state = await self.get_game_state()
+                player_state = await self.get_player_state(self.account.address)
+                
+                if game_state.current_bet == 0 or game_state.current_bet == player_state.current_bet:
+                    await self.make_action(1)  # CHECK
+                else:
+                    await self.make_action(0)  # FOLD
+            except Exception as e2:
+                logger.error(f"Emergency fallback also failed: {e2}")
 
     def _format_cards(self, cards: List[int]) -> str:
         """Format cards into readable strings"""
@@ -421,8 +661,8 @@ class PokerAgent:
                 player_state = await self.get_player_state(self.account.address)
 
                 # Check if it's our turn
-                if game_state.current_turn == self.account.address:
-                    await self.handle_turn(game_state, player_state)
+                if game_state.current_turn.lower() == self.account.address.lower():
+                    await self.process_turn(game_state)
 
                 # Check if player is eliminated
                 if player_state.status == PlayerStatus.ELIMINATED:
@@ -457,6 +697,12 @@ class PokerAgent:
             if not game_state:
                 game_state = await self.get_game_state()
 
+            # Check if this is a new hand
+            if self._is_new_hand(game_state):
+                logger.info(f"Resetting investment tracking for new hand.")
+                self.current_hand_investment = 0
+                self.action_history = []
+
             # Generate unique ID for this turn
             turn_id = self._generate_turn_id(game_state)
             
@@ -465,10 +711,15 @@ class PokerAgent:
                 return
 
             # Verify it's still our turn
-            if game_state.current_turn != self.account.address:
+            if game_state.current_turn.lower() != self.account.address.lower():
                 return
 
             player_state = await self.get_player_state(self.account.address)
+            
+            # Check for blinds
+            await self._check_blinds(game_state, player_state)
+            
+            # Handle the turn
             await self.handle_turn(game_state, player_state)
             
             # Record this turn as processed
@@ -497,7 +748,7 @@ class PokerAgent:
                     event_signature = '0x' + event_signature
 
                 # Format player address as 32-byte topic (ensuring 0x prefix)
-                player_topic = '0x' + self.account.address[2:].rjust(64, '0')
+                player_topic = '0x' + self.account.address.lower()[2:].rjust(64, '0')
 
                 # Get logs
                 logs = self.web3.eth.get_logs({
@@ -505,16 +756,15 @@ class PokerAgent:
                     'fromBlock': from_block,
                     'toBlock': 'latest',
                     'topics': [
-                        event_signature,
-                        player_topic
+                        event_signature
                     ]
                 })
 
                 # Process logs
                 for log in logs:
-                    topics = log['topics']
-                    player_address = self.web3.to_checksum_address(topics[1][-40:])
-                    if player_address == self.account.address:
+                    data = self.web3.codec.decode_abi(['address', 'uint256', 'uint256'], bytes.fromhex(log['data'][2:]))
+                    player_address = data[0]  # First parameter is the player address
+                    if player_address.lower() == self.account.address.lower():
                         logger.info(f"Turn event detected: Block {log['blockNumber']}")
                         await self.process_turn()
 
@@ -530,8 +780,9 @@ class PokerAgent:
                 game_state = await self.get_game_state()
                 player_state = await self.get_player_state(self.account.address)
 
-                # Check if it's our turn
-                if game_state.current_turn == self.account.address:
+                # Check if it's our turn - use case-insensitive comparison
+                if game_state.current_turn.lower() == self.account.address.lower():
+                    logger.info(f"Detected my turn via polling: {self.account.address}")
                     await self.process_turn(game_state)
 
                 # Check if player is eliminated
@@ -541,10 +792,21 @@ class PokerAgent:
                     break
 
                 await asyncio.sleep(1)
-                
+                    
             except Exception as e:
                 logger.error(f"Error in game state monitoring: {e}")
-                await asyncio.sleep(1)        
+                await asyncio.sleep(1)      
+
+    async def get_valid_actions(self, game_state, player_state):
+        """Determine which actions are valid in the current state"""
+        can_fold = True
+        can_check = (game_state.current_bet == 0 or player_state.current_bet == game_state.current_bet)
+        can_call = (player_state.stack >= game_state.current_bet - player_state.current_bet)
+        
+        min_raise = game_state.current_bet * 2
+        can_raise = (player_state.stack >= min_raise)
+        
+        return [can_fold, can_check, can_call, can_raise]
 
     async def start(self):
         """Start the agent with both monitoring methods"""

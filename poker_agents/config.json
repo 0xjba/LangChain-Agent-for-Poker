@@ -28,6 +28,11 @@
         "rpc_url": "POKER_AGENT4_RPC",
         "private_key": "POKER_AGENT4_KEY",
         "model": "POKER_AGENT4_MODEL"
+      },
+      "Agent5": {
+        "rpc_url": "POKER_AGENT5_RPC",
+        "private_key": "POKER_AGENT5_KEY",
+        "model": "POKER_AGENT5_MODEL"
       }
   }
 }
