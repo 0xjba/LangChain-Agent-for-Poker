@@ -3,7 +3,7 @@ import asyncio
 import json
 import logging
 from datetime import datetime, timedelta
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -404,6 +404,7 @@ class TimerAgent:
                     'toBlock': latest_block,
                     'topics': [
                         event_signature
+                        event_signature
                     ]
                 })
                 
@@ -446,7 +447,7 @@ class TimerAgent:
             except Exception as e:
                 logger.error(f"Error monitoring events: {e}")
             
-            await asyncio.sleep(1)
+            await asyncio.sleep(2)  # Check every 2 seconds
 
     async def start(self):
         """Start the timer agent"""
@@ -454,10 +455,11 @@ class TimerAgent:
         logger.info("Starting timer agent...")
         
         try:
-            # Run both monitoring methods concurrently
+            # Run all monitoring methods concurrently
             await asyncio.gather(
                 self.monitor_events(),
-                self.monitor_timers()
+                self.monitor_timers(),
+                self.monitor_blind_levels()
             )
         except Exception as e:
             logger.error(f"Error in timer agent main loop: {e}")
