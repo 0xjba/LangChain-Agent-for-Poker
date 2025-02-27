@@ -174,18 +174,32 @@ class PokerAgent:
                 # For RAISE, include the amount
                 if action_type == 3:
                     # For RAISE, encode the amount as bytes
-                    amount_hex = hex(amount)[2:].zfill(64)  # Convert to hex and pad to 32 bytes
-                    data = bytes.fromhex(amount_hex)
+                    data = encode(['uint256'], [amount])
                     function_data = self.router.encodeABI(fn_name="routeGameAction", args=[action_type, data])
                 else:
                     # For CALL, use empty bytes
                     function_data = self.router.encodeABI(fn_name="routeGameAction", args=[action_type, b''])
             
+
+            try:
+                # Estimate gas instead of hardcoding
+                estimated_gas = self.web3.eth.estimate_gas({
+                    'from': self.account.address, 
+                    'to': self.router.address,
+                    'data': function_data,
+                    'value': 0
+                })
+                gas_limit = int(estimated_gas * 1.3)  # Add 30% buffer
+            except Exception as e:
+                logger.error(f"Gas estimation failed: {e}")
+                # Fall back to default gas limit if estimation fails
+                gas_limit = 300000
+
             # Build transaction
             tx = {
                 'from': self.account.address,
                 'to': self.router.address,
-                'gas': 300000,
+                'gas': gas_limit,
                 'maxFeePerGas': max_fee_per_gas,
                 'maxPriorityFeePerGas': max_priority_fee_per_gas,
                 'chainId': self.web3.eth.chain_id,
@@ -277,7 +291,8 @@ class PokerAgent:
                             }, block_identifier=receipt.blockNumber)
                             logger.error(f"Transaction call result: {result}")
                         except Exception as e:
-                            logger.error(f"Failed to get revert reason: {e}")
+                            error_message = str(e)
+                            logger.error(f"Failed to get revert reason: {error_message}")
                             
                         logger.error(f"Transaction receipt details: {receipt}")
                         
